@@ -1,0 +1,26 @@
+[package]
+name = "binflux"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight MySQL change data capture engine"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-std = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+mysql-binlog-connector-rust = { path = "vendor/mysql-binlog-connector-rust", features = ["rustls"] }
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust", "rustls-tls"] }
+libc = "0.2"
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

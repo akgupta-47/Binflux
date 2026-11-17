@@ -1,0 +1,23 @@
+services:
+  mysql:
+    build:
+      context: .
+      dockerfile: docker/mysql.Dockerfile
+    environment:
+      MYSQL_ROOT_PASSWORD: root-test-only
+      MYSQL_DATABASE: shop
+      MYSQL_USER: binflux
+      MYSQL_PASSWORD: ${BINFLUX_MYSQL_PASSWORD:-binflux-test-only}
+    ports:
+      - "${BINFLUX_MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/10-binflux.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -proot-test-only --silent"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+volumes:
+  mysql-data:
