@@ -6,6 +6,11 @@ source:
   tls_ca_cert: ./tests/certs/ca.pem
   server_id: 90001
   heartbeat_interval_ms: 10000
+  gtid_restart: false
+  retry_initial_delay_ms: 1000
+  retry_max_delay_ms: 30000
+  retry_max_attempts: 0
+  retry_reset_after_ms: 60000
   include_databases:
     - shop
 checkpoint:
@@ -16,3 +21,5 @@ pipeline:
   max_event_bytes: 16777216
   max_transaction_events: 100000
   max_transaction_bytes: 67108864
+metrics:
+  listen_address: 127.0.0.1:9090

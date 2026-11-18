@@ -11,6 +11,9 @@ pub struct Checkpoint {
     pub binlog_file: String,
     pub binlog_position: u32,
     pub gtid: Option<String>,
+    /// Full executed GTID set used for GTID-based resume. Older checkpoints omit this field.
+    #[serde(default)]
+    pub gtid_set: Option<String>,
 }
 
 pub fn load(path: &Path) -> Result<Option<Checkpoint>> {
@@ -90,10 +93,19 @@ mod tests {
             binlog_file: "mysql-bin.000001".into(),
             binlog_position: 123,
             gtid: None,
+            gtid_set: Some("24bc7850-2c16-11e6-a073-0242ac110002:1-3".into()),
         };
         persist(&path, &cp).unwrap();
         assert_eq!(load(&path).unwrap(), Some(cp));
         reset(&path).unwrap();
         assert_eq!(load(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn loads_checkpoints_written_before_gtid_set_support() {
+        let old = br#"{"binlog_file":"mysql-bin.000001","binlog_position":123,"gtid":"uuid:1"}"#;
+        let checkpoint: Checkpoint = serde_json::from_slice(old).unwrap();
+        assert_eq!(checkpoint.gtid.as_deref(), Some("uuid:1"));
+        assert_eq!(checkpoint.gtid_set, None);
     }
 }

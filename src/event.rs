@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ColumnSchema {
     pub name: String,
+    pub sql_type: String,
     pub unsigned: bool,
     pub binary: bool,
 }
@@ -26,6 +27,10 @@ pub struct CdcEvent {
     pub operation: Operation,
     pub timestamp_unix_seconds: u32,
     pub transaction_id: Option<String>,
+    /// Stable SHA-256 fingerprint of the table schema used to decode this row.
+    pub schema_version: String,
+    /// Column metadata for this version, allowing consumers to retain schema history.
+    pub schema: Vec<ColumnSchema>,
     pub position: EventPosition,
     pub row_ordinal: usize,
     pub before: Option<Map<String, Value>>,

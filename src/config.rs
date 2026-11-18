@@ -10,6 +10,7 @@ pub struct Config {
     pub source: SourceConfig,
     pub checkpoint: CheckpointConfig,
     pub pipeline: PipelineConfig,
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,9 +23,15 @@ pub struct SourceConfig {
     pub tls_ca_cert: Option<String>,
     pub server_id: u64,
     pub heartbeat_interval_ms: u64,
+    pub gtid_restart: bool,
     pub initial_file: Option<String>,
     pub initial_position: Option<u32>,
     pub include_databases: Vec<String>,
+    pub retry_initial_delay_ms: u64,
+    pub retry_max_delay_ms: u64,
+    /// Maximum retries after the initial connection attempt; 0 means unlimited.
+    pub retry_max_attempts: u32,
+    pub retry_reset_after_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,6 +50,21 @@ pub struct PipelineConfig {
     pub max_transaction_bytes: usize,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// Optional Prometheus HTTP bind address. Keep this on localhost unless protected externally.
+    pub listen_address: Option<String>,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            listen_address: None,
+        }
+    }
+}
+
 impl Default for SourceConfig {
     fn default() -> Self {
         Self {
@@ -53,9 +75,14 @@ impl Default for SourceConfig {
             tls_ca_cert: None,
             server_id: 90001,
             heartbeat_interval_ms: 10_000,
+            gtid_restart: false,
             initial_file: None,
             initial_position: None,
             include_databases: Vec::new(),
+            retry_initial_delay_ms: 1_000,
+            retry_max_delay_ms: 30_000,
+            retry_max_attempts: 0,
+            retry_reset_after_ms: 60_000,
         }
     }
 }
@@ -104,6 +131,22 @@ impl Config {
         }
         if self.source.initial_position.is_some_and(|p| p < 4) {
             bail!("source.initial_position must be at least 4");
+        }
+        if self.source.gtid_restart && self.source.initial_file.is_some() {
+            bail!("source.gtid_restart cannot be combined with an explicit initial file/position");
+        }
+        if self.source.retry_initial_delay_ms == 0
+            || self.source.retry_max_delay_ms < self.source.retry_initial_delay_ms
+            || self.source.retry_reset_after_ms == 0
+        {
+            bail!(
+                "source retry delays must be nonzero and retry_max_delay_ms must be at least retry_initial_delay_ms"
+            );
+        }
+        if let Some(address) = &self.metrics.listen_address
+            && address.trim().is_empty()
+        {
+            bail!("metrics.listen_address must not be empty when configured");
         }
         if self.pipeline.channel_capacity == 0
             || self.pipeline.max_buffered_bytes == 0

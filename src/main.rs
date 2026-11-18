@@ -3,6 +3,7 @@ mod checkpoint_lock;
 mod cli;
 mod config;
 mod event;
+mod metrics;
 mod pipeline;
 mod sink;
 mod source;
