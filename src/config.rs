@@ -11,6 +11,7 @@ pub struct Config {
     pub checkpoint: CheckpointConfig,
     pub pipeline: PipelineConfig,
     pub metrics: MetricsConfig,
+    pub kafka: KafkaConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,6 +56,38 @@ pub struct PipelineConfig {
 pub struct MetricsConfig {
     /// Optional Prometheus HTTP bind address. Keep this on localhost unless protected externally.
     pub listen_address: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KafkaConfig {
+    pub bootstrap_servers: String,
+    pub topic: String,
+    pub client_id: String,
+    pub partition: i32,
+    pub partition_by: String,
+    pub message_timeout_ms: u64,
+    pub tls: bool,
+    pub sasl_mechanism: Option<String>,
+    pub sasl_username_env: Option<String>,
+    pub sasl_password_env: Option<String>,
+}
+
+impl Default for KafkaConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_servers: "127.0.0.1:9092".into(),
+            topic: "binflux.cdc".into(),
+            client_id: "binflux".into(),
+            partition: 0,
+            partition_by: "fixed".into(),
+            message_timeout_ms: 30_000,
+            tls: false,
+            sasl_mechanism: None,
+            sasl_username_env: None,
+            sasl_password_env: None,
+        }
+    }
 }
 
 impl Default for MetricsConfig {
@@ -147,6 +180,57 @@ impl Config {
             && address.trim().is_empty()
         {
             bail!("metrics.listen_address must not be empty when configured");
+        }
+        if self.kafka.bootstrap_servers.trim().is_empty()
+            || self.kafka.topic.trim().is_empty()
+            || self.kafka.client_id.trim().is_empty()
+            || self.kafka.message_timeout_ms == 0
+        {
+            bail!(
+                "Kafka bootstrap_servers, topic, client_id, and nonzero message_timeout_ms are required"
+            );
+        }
+        for broker in self.kafka.bootstrap_servers.split(',') {
+            let (host, port) = broker.trim().rsplit_once(':').ok_or_else(|| {
+                anyhow::anyhow!("Kafka broker {broker:?} must use host:port format")
+            })?;
+            if host.trim().is_empty() || port.parse::<u16>().ok().is_none_or(|port| port == 0) {
+                bail!("Kafka broker {broker:?} must use a nonempty host and port 1-65535");
+            }
+        }
+        if self.kafka.partition < 0 {
+            bail!("kafka.partition must be zero or greater");
+        }
+        if !["fixed", "database", "table", "primary_key"]
+            .iter()
+            .any(|option| self.kafka.partition_by.eq_ignore_ascii_case(option))
+        {
+            bail!("kafka.partition_by must be fixed, database, table, or primary_key");
+        }
+        let topic_pattern = self
+            .kafka
+            .topic
+            .replace("%{database}", "")
+            .replace("%{table}", "");
+        if topic_pattern.contains("%{") || topic_pattern.contains('}') {
+            bail!("kafka.topic supports only the %{{database}} and %{{table}} substitutions");
+        }
+        if self.kafka.sasl_username_env.is_some() != self.kafka.sasl_password_env.is_some()
+            || self.kafka.sasl_username_env.is_some() != self.kafka.sasl_mechanism.is_some()
+        {
+            bail!(
+                "Kafka SASL mechanism, username, and password environment variable names must be configured together"
+            );
+        }
+        if self.kafka.sasl_mechanism.is_some() && !self.kafka.tls {
+            bail!("Kafka SASL authentication requires kafka.tls: true");
+        }
+        if let Some(mechanism) = &self.kafka.sasl_mechanism
+            && !["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"]
+                .iter()
+                .any(|supported| mechanism.eq_ignore_ascii_case(supported))
+        {
+            bail!("kafka.sasl_mechanism must be PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512");
         }
         if self.pipeline.channel_capacity == 0
             || self.pipeline.max_buffered_bytes == 0

@@ -31,13 +31,10 @@ async fn main() -> Result<()> {
             cfg.validate()?;
             println!("configuration is valid");
         }
-        Command::Run {
-            config: path,
-            sink: _,
-        } => {
+        Command::Run { config: path, sink } => {
             let cfg = config::Config::load(&path)?;
             cfg.validate()?;
-            pipeline::run(cfg).await?;
+            pipeline::run(cfg, sink).await?;
         }
         Command::Source {
             command: SourceCommand::Check { config: path },

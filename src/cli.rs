@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "binflux",
     version,
-    about = "MySQL change data capture to JSON Lines"
+    about = "MySQL change data capture to stdout or Kafka"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -67,4 +67,5 @@ pub enum CheckpointCommand {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum SinkKind {
     Stdout,
+    Kafka,
 }

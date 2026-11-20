@@ -15,8 +15,9 @@ impl<W: Write> StdoutSink<W> {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl<W: Write> Sink for StdoutSink<W> {
-    fn write_transaction(&mut self, events: &[CdcEvent]) -> Result<()> {
+    async fn write_transaction(&mut self, events: &[CdcEvent]) -> Result<()> {
         for event in events {
             serde_json::to_writer(&mut self.writer, event)?;
             self.writer.write_all(b"\n")?;
@@ -26,7 +27,7 @@ impl<W: Write> Sink for StdoutSink<W> {
             .context("flushing committed JSONL transaction")
     }
 
-    fn flush(&mut self) -> Result<()> {
+    async fn flush(&mut self) -> Result<()> {
         self.writer.flush().context("flushing JSONL stdout")
     }
 }

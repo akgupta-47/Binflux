@@ -10,6 +10,7 @@ pub struct ColumnSchema {
     pub sql_type: String,
     pub unsigned: bool,
     pub binary: bool,
+    pub primary_key: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

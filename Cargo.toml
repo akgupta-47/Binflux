@@ -10,6 +10,11 @@ anyhow = "1"
 async-std = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+chrono = "0.4"
+rskafka = { version = "0.6", features = ["full"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 mysql-binlog-connector-rust = { path = "vendor/mysql-binlog-connector-rust", features = ["rustls"] }
 mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust", "rustls-tls"] }
 libc = "0.2"

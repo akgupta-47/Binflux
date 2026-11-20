@@ -4,7 +4,7 @@ use crate::{
     config::Config,
     event::{self, CdcEvent, ColumnSchema, EventPosition, Operation, SourceIdentity},
     metrics::Metrics,
-    sink::{Sink, stdout::StdoutSink},
+    sink::{Sink, kafka::KafkaSink, stdout::StdoutSink},
     source::{self, SharedCheckpoint, SourceMessage},
 };
 use anyhow::{Context, Result, bail};
@@ -67,7 +67,7 @@ struct ResolvedTable {
     schema_version: Option<String>,
 }
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(config: Config, sink_kind: crate::cli::SinkKind) -> Result<()> {
     let path = Path::new(&config.checkpoint.path).to_path_buf();
     let _checkpoint_lock = CheckpointLock::acquire(&path)?;
     let pool = source::query_pool(&config)?;
@@ -90,6 +90,19 @@ pub async fn run(config: Config) -> Result<()> {
     };
     let shared: SharedCheckpoint = Arc::new(Mutex::new(initial_checkpoint.clone()));
     let (tx, mut rx) = mpsc::channel(config.pipeline.channel_capacity);
+    let mut transaction = Transaction::new();
+    let mut table_maps: HashMap<u64, ResolvedTable> = HashMap::new();
+    let mut current_file = initial_checkpoint.map(|c| c.binlog_file);
+    let mut stdout_sink = StdoutSink::new(io::stdout().lock());
+    let mut kafka_sink = if matches!(sink_kind, crate::cli::SinkKind::Kafka) {
+        Some(KafkaSink::new(&config.kafka).await?)
+    } else {
+        None
+    };
+    let sink: &mut dyn Sink = match kafka_sink.as_mut() {
+        Some(sink) => sink,
+        None => &mut stdout_sink,
+    };
     let _reader = source::spawn(
         config.clone(),
         shared.clone(),
@@ -97,10 +110,6 @@ pub async fn run(config: Config) -> Result<()> {
         metrics.clone(),
         tx,
     )?;
-    let mut transaction = Transaction::new();
-    let mut table_maps: HashMap<u64, ResolvedTable> = HashMap::new();
-    let mut current_file = initial_checkpoint.map(|c| c.binlog_file);
-    let mut sink = StdoutSink::new(io::stdout().lock());
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -108,7 +117,7 @@ pub async fn run(config: Config) -> Result<()> {
         tokio::select! {
             _ = &mut shutdown => {
                 info!("shutdown requested; only committed transactions are retained");
-                sink.close()?;
+                sink.close().await?;
                 break;
             }
             message = rx.recv() => {
@@ -140,7 +149,7 @@ pub async fn run(config: Config) -> Result<()> {
                     SourceMessage::Fatal(reason) => bail!("source adapter stopped safely: {reason}"),
                     SourceMessage::Event { header, data, _budget } => {
                         metrics.queue_depth(rx.len());
-                        process_event(&config, &pool, &path, &shared, &mut sink, &mut transaction,
+                        process_event(&config, &pool, &path, &shared, sink, &mut transaction,
                             &mut table_maps, &mut current_file, &initial_gtid_set, &metrics, header, *data).await?;
                         metrics.queue_depth(rx.len());
                         drop(_budget);
@@ -161,7 +170,7 @@ async fn process_event(
     pool: &Pool,
     checkpoint_path: &Path,
     shared: &SharedCheckpoint,
-    sink: &mut impl Sink,
+    sink: &mut dyn Sink,
     transaction: &mut Transaction,
     table_maps: &mut HashMap<u64, ResolvedTable>,
     current_file: &mut Option<String>,
@@ -255,7 +264,8 @@ async fn process_event(
                     &header,
                     current_file,
                     None,
-                )?;
+                )
+                .await?;
             } else if is_ddl(&sql) {
                 let included = config.source.include_databases.is_empty()
                     || query.schema.is_empty()
@@ -296,7 +306,8 @@ async fn process_event(
                     &header,
                     current_file,
                     transaction.gtid.clone(),
-                )?;
+                )
+                .await?;
                 // Force a fresh TABLE_MAP lookup after schema-changing DDL.
                 table_maps.clear();
             } else if sql == "rollback" {
@@ -478,7 +489,8 @@ async fn process_event(
                 &header,
                 current_file,
                 transaction.gtid.clone(),
-            )?;
+            )
+            .await?;
         }
         EventData::XaPrepare(_) => bail!(
             "XA_PREPARE events are unsupported; refusing to checkpoint an ambiguous transaction"
@@ -498,8 +510,8 @@ async fn load_schema(pool: &Pool, map: &TableMapEvent) -> Result<(Vec<ColumnSche
             map.database_name, map.table_name
         )
     })?;
-    let rows: Vec<(String, String, Option<String>, String)> = conn.exec(
-        "SELECT COLUMN_NAME, COLUMN_TYPE, CHARACTER_SET_NAME, DATA_TYPE FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+    let rows: Vec<(String, String, Option<String>, String, Option<String>)> = conn.exec(
+        "SELECT COLUMN_NAME, COLUMN_TYPE, CHARACTER_SET_NAME, DATA_TYPE, COLUMN_KEY FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
         (&map.database_name, &map.table_name),
     ).await.with_context(|| format!("querying schema for {}.{}", map.database_name, map.table_name))?;
     if rows.is_empty() {
@@ -513,7 +525,7 @@ async fn load_schema(pool: &Pool, map: &TableMapEvent) -> Result<(Vec<ColumnSche
     let version = format!("sha256:{:x}", Sha256::digest(canonical));
     let columns = rows
         .into_iter()
-        .map(|(name, kind, charset, data_type)| ColumnSchema {
+        .map(|(name, kind, charset, data_type, key_type)| ColumnSchema {
             unsigned: kind.to_ascii_lowercase().contains("unsigned"),
             sql_type: kind,
             binary: !matches!(
@@ -530,6 +542,7 @@ async fn load_schema(pool: &Pool, map: &TableMapEvent) -> Result<(Vec<ColumnSche
                     | "binary"
                     | "varbinary"
             ),
+            primary_key: key_type.as_deref() == Some("PRI"),
             name,
         })
         .collect();
@@ -557,7 +570,7 @@ fn append_event(config: &Config, tx: &mut Transaction, event: CdcEvent) -> Resul
 }
 
 #[allow(clippy::too_many_arguments)]
-fn commit<S: Sink>(
+async fn commit<S: Sink + ?Sized>(
     checkpoint_path: &Path,
     shared: &SharedCheckpoint,
     sink: &mut S,
@@ -570,8 +583,8 @@ fn commit<S: Sink>(
     if !tx.active {
         bail!("commit boundary received without an active transaction");
     }
-    sink.write_transaction(&tx.events)?;
-    sink.flush()?;
+    sink.write_transaction(&tx.events).await?;
+    sink.flush().await?;
     let checkpoint = Checkpoint {
         binlog_file: current_file
             .clone()
@@ -707,15 +720,16 @@ mod tests {
     struct TestSink {
         bytes: Vec<u8>,
     }
+    #[async_trait::async_trait(?Send)]
     impl Sink for TestSink {
-        fn write_transaction(&mut self, events: &[CdcEvent]) -> Result<()> {
+        async fn write_transaction(&mut self, events: &[CdcEvent]) -> Result<()> {
             for event in events {
                 self.bytes.extend(serde_json::to_vec(event)?);
                 self.bytes.push(b'\n');
             }
             Ok(())
         }
-        fn flush(&mut self) -> Result<()> {
+        async fn flush(&mut self) -> Result<()> {
             Ok(())
         }
     }
@@ -777,8 +791,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn checkpoint_only_moves_after_stdout_flush_and_full_commit() {
+    #[tokio::test]
+    async fn checkpoint_only_moves_after_stdout_flush_and_full_commit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint.json");
         let shared = Arc::new(Mutex::new(None));
@@ -805,6 +819,7 @@ mod tests {
             &Some("bin.000001".into()),
             None,
         )
+        .await
         .unwrap();
         assert_eq!(
             checkpoint::load(&path).unwrap().unwrap().binlog_position,
