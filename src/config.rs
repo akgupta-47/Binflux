@@ -39,12 +39,16 @@ pub struct SourceConfig {
 #[serde(default)]
 pub struct CheckpointConfig {
     pub path: String,
+    /// Maximum delay before an acknowledged checkpoint is durably written.
+    pub flush_interval_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PipelineConfig {
     pub channel_capacity: usize,
+    /// Maximum committed source transactions awaiting sink acknowledgements.
+    pub max_in_flight_transactions: usize,
     pub max_buffered_bytes: usize,
     pub max_event_bytes: usize,
     pub max_transaction_events: usize,
@@ -123,6 +127,7 @@ impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
             path: "./data/checkpoint.json".into(),
+            flush_interval_ms: 1_000,
         }
     }
 }
@@ -130,6 +135,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             channel_capacity: 8,
+            max_in_flight_transactions: 8,
             max_buffered_bytes: 32 * 1024 * 1024,
             max_event_bytes: 16 * 1024 * 1024,
             max_transaction_events: 100_000,
@@ -155,6 +161,9 @@ impl Config {
         }
         if self.source.server_id == 0 {
             bail!("source.server_id must be nonzero");
+        }
+        if self.pipeline.max_in_flight_transactions == 0 {
+            bail!("pipeline.max_in_flight_transactions must be at least 1");
         }
         if self.source.username.is_empty() {
             bail!("source.username must not be empty");
@@ -246,8 +255,8 @@ impl Config {
         if self.pipeline.max_buffered_bytes > tokio::sync::Semaphore::MAX_PERMITS {
             bail!("pipeline.max_buffered_bytes exceeds the bounded queue limit");
         }
-        if self.checkpoint.path.is_empty() {
-            bail!("checkpoint.path must not be empty");
+        if self.checkpoint.path.is_empty() || self.checkpoint.flush_interval_ms == 0 {
+            bail!("checkpoint.path and checkpoint.flush_interval_ms must be valid");
         }
         Ok(())
     }

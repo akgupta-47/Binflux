@@ -12,6 +12,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 chrono = "0.4"
+futures = "0.3"
 rskafka = { version = "0.6", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"

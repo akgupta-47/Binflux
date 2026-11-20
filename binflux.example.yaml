@@ -15,8 +15,10 @@ source:
     - shop
 checkpoint:
   path: ./data/checkpoint.json
+  flush_interval_ms: 1000
 pipeline:
   channel_capacity: 8
+  max_in_flight_transactions: 8
   max_buffered_bytes: 33554432
   max_event_bytes: 16777216
   max_transaction_events: 100000

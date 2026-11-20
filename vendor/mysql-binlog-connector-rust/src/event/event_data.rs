@@ -11,6 +11,7 @@ use super::{
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub enum EventData {
     NotSupported,
+    Stop,
     FormatDescription(FormatDescriptionEvent),
     PreviousGtids(PreviousGtidsEvent),
     Gtid(GtidEvent),

@@ -15,12 +15,13 @@ use mysql_binlog_connector_rust::event::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use tracing::{debug, info, warn};
 
 struct Transaction {
@@ -29,6 +30,13 @@ struct Transaction {
     gtid_set: Option<String>,
     events: Vec<CdcEvent>,
     bytes: usize,
+}
+
+struct PendingDelivery {
+    sequence: usize,
+    checkpoint: Checkpoint,
+    event_count: usize,
+    acknowledged: bool,
 }
 impl Transaction {
     fn new() -> Self {
@@ -56,6 +64,64 @@ impl Transaction {
     }
     fn clear(&mut self) {
         *self = Self::new();
+    }
+}
+
+struct CheckpointWriter {
+    path: PathBuf,
+    flush_interval: Duration,
+    last_flush: Instant,
+    latest: Option<Checkpoint>,
+    dirty: bool,
+}
+
+impl CheckpointWriter {
+    fn new(path: PathBuf, initial: Option<Checkpoint>, flush_interval: Duration) -> Self {
+        Self {
+            path,
+            flush_interval,
+            last_flush: Instant::now(),
+            latest: initial,
+            dirty: false,
+        }
+    }
+
+    fn advance(
+        &mut self,
+        checkpoint: Checkpoint,
+        shared: &SharedCheckpoint,
+        metrics: &Metrics,
+        force: bool,
+    ) -> Result<()> {
+        *shared.lock().unwrap_or_else(|p| p.into_inner()) = Some(checkpoint.clone());
+        self.latest = Some(checkpoint);
+        self.dirty = true;
+        if force || self.last_flush.elapsed() >= self.flush_interval {
+            self.flush(metrics)?;
+        }
+        Ok(())
+    }
+
+    fn flush_if_due(&mut self, metrics: &Metrics) -> Result<()> {
+        if self.dirty && self.last_flush.elapsed() >= self.flush_interval {
+            self.flush(metrics)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, metrics: &Metrics) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let checkpoint = self
+            .latest
+            .as_ref()
+            .context("no checkpoint is available to persist")?;
+        checkpoint::persist(&self.path, checkpoint)?;
+        metrics.checkpoint_position(checkpoint.binlog_position);
+        self.last_flush = Instant::now();
+        self.dirty = false;
+        Ok(())
     }
 }
 
@@ -89,19 +155,19 @@ pub async fn run(config: Config, sink_kind: crate::cli::SinkKind) -> Result<()> 
         None
     };
     let shared: SharedCheckpoint = Arc::new(Mutex::new(initial_checkpoint.clone()));
+    let mut checkpoint_writer = CheckpointWriter::new(
+        path,
+        initial_checkpoint.clone(),
+        Duration::from_millis(config.checkpoint.flush_interval_ms),
+    );
     let (tx, mut rx) = mpsc::channel(config.pipeline.channel_capacity);
     let mut transaction = Transaction::new();
     let mut table_maps: HashMap<u64, ResolvedTable> = HashMap::new();
-    let mut current_file = initial_checkpoint.map(|c| c.binlog_file);
-    let mut stdout_sink = StdoutSink::new(io::stdout().lock());
-    let mut kafka_sink = if matches!(sink_kind, crate::cli::SinkKind::Kafka) {
-        Some(KafkaSink::new(&config.kafka).await?)
+    let mut current_file = initial_checkpoint.as_ref().map(|c| c.binlog_file.clone());
+    let sink: Arc<dyn Sink> = if matches!(sink_kind, crate::cli::SinkKind::Kafka) {
+        Arc::new(KafkaSink::new(&config.kafka).await?)
     } else {
-        None
-    };
-    let sink: &mut dyn Sink = match kafka_sink.as_mut() {
-        Some(sink) => sink,
-        None => &mut stdout_sink,
+        Arc::new(StdoutSink::new(io::stdout()))
     };
     let _reader = source::spawn(
         config.clone(),
@@ -112,15 +178,34 @@ pub async fn run(config: Config, sink_kind: crate::cli::SinkKind) -> Result<()> 
     )?;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let mut checkpoint_tick = tokio::time::interval(checkpoint_writer.flush_interval);
+    checkpoint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut delivery_tasks: JoinSet<Result<(usize, usize)>> = JoinSet::new();
+    let mut pending_deliveries = VecDeque::new();
+    let mut next_delivery_sequence = 0usize;
+    let mut planned_checkpoint = initial_checkpoint;
+    let max_in_flight_transactions = if matches!(sink_kind, crate::cli::SinkKind::Kafka) {
+        config.pipeline.max_in_flight_transactions
+    } else {
+        1
+    };
 
     loop {
         tokio::select! {
             _ = &mut shutdown => {
                 info!("shutdown requested; only committed transactions are retained");
+                drain_deliveries(&mut delivery_tasks, &mut pending_deliveries, &mut checkpoint_writer, &shared, &metrics).await?;
                 sink.close().await?;
+                checkpoint_writer.flush(&metrics)?;
                 break;
             }
-            message = rx.recv() => {
+            _ = checkpoint_tick.tick() => {
+                checkpoint_writer.flush_if_due(&metrics)?;
+            }
+            result = delivery_tasks.join_next(), if !delivery_tasks.is_empty() => {
+                apply_delivery_result(result, &mut pending_deliveries, &mut checkpoint_writer, &shared, &metrics)?;
+            }
+            message = rx.recv(), if pending_deliveries.len() < max_in_flight_transactions => {
                 let Some(message) = message else { break; };
                 match message {
                     SourceMessage::Started { file, position } => {
@@ -132,15 +217,16 @@ pub async fn run(config: Config, sink_kind: crate::cli::SinkKind) -> Result<()> 
                         };
                         transaction.clear();
                         table_maps.clear();
-                        let mut saved = shared.lock().unwrap_or_else(|p| p.into_inner());
-                        if saved.is_none() && !file.is_empty() {
+                        let has_checkpoint = shared.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+                        if !has_checkpoint && !file.is_empty() {
                             let baseline = Checkpoint { binlog_file: file, binlog_position: position.max(4), gtid: None, gtid_set: initial_gtid_set.clone() };
-                            checkpoint::persist(&path, &baseline)?;
-                            metrics.checkpoint_position(baseline.binlog_position);
-                            *saved = Some(baseline);
+                            checkpoint_writer.advance(baseline.clone(), &shared, &metrics, true)?;
+                            planned_checkpoint = Some(baseline);
                         }
                     }
                     SourceMessage::Disconnected(reason) => {
+                        drain_deliveries(&mut delivery_tasks, &mut pending_deliveries, &mut checkpoint_writer, &shared, &metrics).await?;
+                        planned_checkpoint = shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
                         metrics.connected(false);
                         warn!(%reason, "source disconnected; dropping the uncommitted transaction buffer");
                         transaction.clear();
@@ -148,9 +234,15 @@ pub async fn run(config: Config, sink_kind: crate::cli::SinkKind) -> Result<()> 
                     }
                     SourceMessage::Fatal(reason) => bail!("source adapter stopped safely: {reason}"),
                     SourceMessage::Event { header, data, _budget } => {
+                        if matches!(data.as_ref(), EventData::Rotate(_)) {
+                            drain_deliveries(&mut delivery_tasks, &mut pending_deliveries, &mut checkpoint_writer, &shared, &metrics).await?;
+                            planned_checkpoint = shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        }
                         metrics.queue_depth(rx.len());
-                        process_event(&config, &pool, &path, &shared, sink, &mut transaction,
-                            &mut table_maps, &mut current_file, &initial_gtid_set, &metrics, header, *data).await?;
+                        process_event(&config, &pool, &mut checkpoint_writer, &shared, &sink, &mut transaction,
+                            &mut table_maps, &mut current_file, &initial_gtid_set, &mut planned_checkpoint,
+                            &mut delivery_tasks, &mut pending_deliveries, &mut next_delivery_sequence,
+                            &metrics, header, *data).await?;
                         metrics.queue_depth(rx.len());
                         drop(_budget);
                     }
@@ -158,6 +250,15 @@ pub async fn run(config: Config, sink_kind: crate::cli::SinkKind) -> Result<()> 
             }
         }
     }
+    drain_deliveries(
+        &mut delivery_tasks,
+        &mut pending_deliveries,
+        &mut checkpoint_writer,
+        &shared,
+        &metrics,
+    )
+    .await?;
+    checkpoint_writer.flush(&metrics)?;
     pool.disconnect()
         .await
         .context("closing schema lookup pool")?;
@@ -168,13 +269,17 @@ pub async fn run(config: Config, sink_kind: crate::cli::SinkKind) -> Result<()> 
 async fn process_event(
     config: &Config,
     pool: &Pool,
-    checkpoint_path: &Path,
+    checkpoint_writer: &mut CheckpointWriter,
     shared: &SharedCheckpoint,
-    sink: &mut dyn Sink,
+    sink: &Arc<dyn Sink>,
     transaction: &mut Transaction,
     table_maps: &mut HashMap<u64, ResolvedTable>,
     current_file: &mut Option<String>,
     initial_gtid_set: &Option<String>,
+    planned_checkpoint: &mut Option<Checkpoint>,
+    delivery_tasks: &mut JoinSet<Result<(usize, usize)>>,
+    pending_deliveries: &mut VecDeque<PendingDelivery>,
+    next_delivery_sequence: &mut usize,
     metrics: &Metrics,
     header: EventHeader,
     data: EventData,
@@ -187,7 +292,8 @@ async fn process_event(
         })
     };
     match data {
-        EventData::FormatDescription(_)
+        EventData::Stop
+        | EventData::FormatDescription(_)
         | EventData::PreviousGtids(_)
         | EventData::HeartBeat
         | EventData::RowsQuery(_) => {}
@@ -213,15 +319,12 @@ async fn process_event(
                     .and_then(|cp| cp.gtid_set.clone())
                     .or_else(|| initial_gtid_set.clone()),
             };
-            checkpoint::persist(checkpoint_path, &cp)?;
-            metrics.checkpoint_position(cp.binlog_position);
-            *shared.lock().unwrap_or_else(|p| p.into_inner()) = Some(cp);
+            checkpoint_writer.advance(cp.clone(), shared, metrics, false)?;
+            *planned_checkpoint = Some(cp);
         }
         EventData::Gtid(gtid) => {
             let prior_set = if config.source.gtid_restart {
-                shared
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
+                planned_checkpoint
                     .as_ref()
                     .and_then(|cp| cp.gtid_set.clone())
                     .or_else(|| initial_gtid_set.clone())
@@ -240,9 +343,7 @@ async fn process_event(
             if sql == "begin" || sql.starts_with("begin ") || sql == "start transaction" {
                 if !transaction.active {
                     let prior_set = if config.source.gtid_restart {
-                        shared
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
+                        planned_checkpoint
                             .as_ref()
                             .and_then(|cp| cp.gtid_set.clone())
                             .or_else(|| initial_gtid_set.clone())
@@ -256,11 +357,12 @@ async fn process_event(
                     bail!("COMMIT query received without an active transaction");
                 }
                 commit(
-                    checkpoint_path,
-                    shared,
                     sink,
                     transaction,
-                    metrics,
+                    planned_checkpoint,
+                    delivery_tasks,
+                    pending_deliveries,
+                    next_delivery_sequence,
                     &header,
                     current_file,
                     None,
@@ -287,9 +389,7 @@ async fn process_event(
                 }
                 if !transaction.active {
                     let prior_set = if config.source.gtid_restart {
-                        shared
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
+                        planned_checkpoint
                             .as_ref()
                             .and_then(|cp| cp.gtid_set.clone())
                     } else {
@@ -298,11 +398,12 @@ async fn process_event(
                     transaction.begin(None, prior_set)?;
                 }
                 commit(
-                    checkpoint_path,
-                    shared,
                     sink,
                     transaction,
-                    metrics,
+                    planned_checkpoint,
+                    delivery_tasks,
+                    pending_deliveries,
+                    next_delivery_sequence,
                     &header,
                     current_file,
                     transaction.gtid.clone(),
@@ -481,11 +582,12 @@ async fn process_event(
         EventData::Xid(_) => {
             require_transaction(transaction)?;
             commit(
-                checkpoint_path,
-                shared,
                 sink,
                 transaction,
-                metrics,
+                planned_checkpoint,
+                delivery_tasks,
+                pending_deliveries,
+                next_delivery_sequence,
                 &header,
                 current_file,
                 transaction.gtid.clone(),
@@ -570,12 +672,13 @@ fn append_event(config: &Config, tx: &mut Transaction, event: CdcEvent) -> Resul
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn commit<S: Sink + ?Sized>(
-    checkpoint_path: &Path,
-    shared: &SharedCheckpoint,
-    sink: &mut S,
+async fn commit(
+    sink: &Arc<dyn Sink>,
     tx: &mut Transaction,
-    metrics: &Metrics,
+    planned_checkpoint: &mut Option<Checkpoint>,
+    delivery_tasks: &mut JoinSet<Result<(usize, usize)>>,
+    pending_deliveries: &mut VecDeque<PendingDelivery>,
+    next_delivery_sequence: &mut usize,
     header: &EventHeader,
     current_file: &Option<String>,
     gtid: Option<String>,
@@ -583,8 +686,6 @@ async fn commit<S: Sink + ?Sized>(
     if !tx.active {
         bail!("commit boundary received without an active transaction");
     }
-    sink.write_transaction(&tx.events).await?;
-    sink.flush().await?;
     let checkpoint = Checkpoint {
         binlog_file: current_file
             .clone()
@@ -594,22 +695,75 @@ async fn commit<S: Sink + ?Sized>(
         gtid_set: if tx.gtid_set.is_some() {
             tx.gtid_set.clone()
         } else {
-            shared
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
+            planned_checkpoint
                 .as_ref()
                 .and_then(|cp| cp.gtid_set.clone())
         },
     };
-    checkpoint::persist(checkpoint_path, &checkpoint)?;
-    metrics.checkpoint_position(checkpoint.binlog_position);
-    metrics.transaction_delivered(tx.events.len());
-    *shared.lock().unwrap_or_else(|p| p.into_inner()) = Some(checkpoint);
-    info!(
-        event_count = tx.events.len(),
-        "committed transaction delivered"
-    );
+    let event_count = tx.events.len();
+    let events = std::mem::take(&mut tx.events);
+    let sequence = *next_delivery_sequence;
+    *next_delivery_sequence = next_delivery_sequence.wrapping_add(1);
+    let sink = sink.clone();
+    delivery_tasks.spawn(async move {
+        sink.write_transaction(sequence, &events).await?;
+        sink.flush().await?;
+        Ok((sequence, event_count))
+    });
+    pending_deliveries.push_back(PendingDelivery {
+        sequence,
+        checkpoint: checkpoint.clone(),
+        event_count,
+        acknowledged: false,
+    });
+    *planned_checkpoint = Some(checkpoint);
     tx.clear();
+    Ok(())
+}
+
+fn apply_delivery_result(
+    result: Option<std::result::Result<Result<(usize, usize)>, tokio::task::JoinError>>,
+    pending: &mut VecDeque<PendingDelivery>,
+    checkpoint_writer: &mut CheckpointWriter,
+    shared: &SharedCheckpoint,
+    metrics: &Metrics,
+) -> Result<()> {
+    let task_result = result.context("Kafka delivery worker ended unexpectedly")?;
+    let delivery_result = task_result.context("Kafka delivery worker panicked")?;
+    let (sequence, event_count) = delivery_result.context("Kafka transaction delivery failed")?;
+    let delivery = pending
+        .iter_mut()
+        .find(|delivery| delivery.sequence == sequence)
+        .context("delivery acknowledgement has no matching source transaction")?;
+    delivery.acknowledged = true;
+    delivery.event_count = event_count;
+
+    while pending
+        .front()
+        .is_some_and(|delivery| delivery.acknowledged)
+    {
+        let delivery = pending.pop_front().expect("front delivery was present");
+        checkpoint_writer.advance(delivery.checkpoint, shared, metrics, false)?;
+        metrics.transaction_delivered(delivery.event_count);
+        info!(
+            event_count = delivery.event_count,
+            "committed transaction delivered"
+        );
+    }
+    Ok(())
+}
+
+async fn drain_deliveries(
+    delivery_tasks: &mut JoinSet<Result<(usize, usize)>>,
+    pending: &mut VecDeque<PendingDelivery>,
+    checkpoint_writer: &mut CheckpointWriter,
+    shared: &SharedCheckpoint,
+    metrics: &Metrics,
+) -> Result<()> {
+    while !pending.is_empty() {
+        let result = delivery_tasks.join_next().await;
+        apply_delivery_result(result, pending, checkpoint_writer, shared, metrics)?;
+    }
     Ok(())
 }
 
@@ -718,18 +872,19 @@ mod tests {
     use mysql_binlog_connector_rust::event::event_header::EventHeader;
 
     struct TestSink {
-        bytes: Vec<u8>,
+        bytes: Mutex<Vec<u8>>,
     }
-    #[async_trait::async_trait(?Send)]
+    #[async_trait::async_trait]
     impl Sink for TestSink {
-        async fn write_transaction(&mut self, events: &[CdcEvent]) -> Result<()> {
+        async fn write_transaction(&self, _sequence: usize, events: &[CdcEvent]) -> Result<()> {
+            let mut bytes = self.bytes.lock().unwrap();
             for event in events {
-                self.bytes.extend(serde_json::to_vec(event)?);
-                self.bytes.push(b'\n');
+                bytes.extend(serde_json::to_vec(event)?);
+                bytes.push(b'\n');
             }
             Ok(())
         }
-        async fn flush(&mut self) -> Result<()> {
+        async fn flush(&self) -> Result<()> {
             Ok(())
         }
     }
@@ -796,11 +951,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint.json");
         let shared = Arc::new(Mutex::new(None));
+        let mut checkpoint_writer =
+            CheckpointWriter::new(path.clone(), None, Duration::from_secs(60));
         let mut tx = Transaction::new();
         tx.begin(Some("24bc7850-2c16-11e6-a073-0242ac110002:9".into()), None)
             .unwrap();
-        let mut output = TestSink { bytes: Vec::new() };
+        let output: Arc<dyn Sink> = Arc::new(TestSink {
+            bytes: Mutex::new(Vec::new()),
+        });
         let metrics = Metrics::default();
+        let mut delivery_tasks = JoinSet::new();
+        let mut pending_deliveries = VecDeque::new();
+        let mut next_sequence = 0;
+        let mut planned_checkpoint = None;
         let header = EventHeader {
             timestamp: 1,
             event_type: 16,
@@ -810,17 +973,30 @@ mod tests {
             event_flags: 0,
         };
         commit(
-            &path,
-            &shared,
-            &mut output,
+            &output,
             &mut tx,
-            &metrics,
+            &mut planned_checkpoint,
+            &mut delivery_tasks,
+            &mut pending_deliveries,
+            &mut next_sequence,
             &header,
             &Some("bin.000001".into()),
             None,
         )
         .await
         .unwrap();
+        assert!(shared.lock().unwrap().is_none());
+        drain_deliveries(
+            &mut delivery_tasks,
+            &mut pending_deliveries,
+            &mut checkpoint_writer,
+            &shared,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(shared.lock().unwrap().as_ref().unwrap().binlog_position, 99);
+        checkpoint_writer.flush(&metrics).unwrap();
         assert_eq!(
             checkpoint::load(&path).unwrap().unwrap().binlog_position,
             99

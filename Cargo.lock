@@ -326,6 +326,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "futures",
  "libc",
  "mysql-binlog-connector-rust",
  "mysql_async",

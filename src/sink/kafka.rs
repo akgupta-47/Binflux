@@ -18,18 +18,25 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing::info;
 
 use super::Sink;
 
 pub struct KafkaSink {
     client: Client,
-    partitions: HashMap<(String, i32), rskafka::client::partition::PartitionClient>,
-    topic_partitions: HashMap<String, Vec<i32>>,
+    partition_workers: Mutex<HashMap<(String, i32), mpsc::Sender<PartitionWrite>>>,
+    topic_partitions: Mutex<HashMap<String, Vec<i32>>>,
+    dispatch_sequence: watch::Sender<usize>,
     topic_template: String,
     partition_id: i32,
     partition_by: String,
     timeout: Duration,
+}
+
+struct PartitionWrite {
+    records: Vec<Record>,
+    acknowledgement: oneshot::Sender<Result<()>>,
 }
 
 impl KafkaSink {
@@ -86,10 +93,12 @@ impl KafkaSink {
             partition = config.partition,
             "Kafka sink connected"
         );
+        let (dispatch_sequence, _) = watch::channel(0usize);
         Ok(Self {
             client,
-            partitions: HashMap::new(),
-            topic_partitions: HashMap::new(),
+            partition_workers: Mutex::new(HashMap::new()),
+            topic_partitions: Mutex::new(HashMap::new()),
+            dispatch_sequence,
             topic_template: config.topic.clone(),
             partition_id: config.partition,
             partition_by: config.partition_by.clone(),
@@ -115,8 +124,8 @@ impl KafkaSink {
         Ok(topic)
     }
 
-    async fn partition_ids(&mut self, topic: &str) -> Result<Vec<i32>> {
-        if let Some(partitions) = self.topic_partitions.get(topic) {
+    async fn partition_ids(&self, topic: &str) -> Result<Vec<i32>> {
+        if let Some(partitions) = self.topic_partitions.lock().await.get(topic) {
             return Ok(partitions.clone());
         }
         let topics = self
@@ -133,52 +142,103 @@ impl KafkaSink {
                 format!("Kafka topic {topic:?} does not exist or has no partitions")
             })?;
         self.topic_partitions
+            .lock()
+            .await
             .insert(topic.to_owned(), partitions.clone());
         Ok(partitions)
     }
 
-    async fn produce_to_partition(
-        &mut self,
+    async fn partition_worker(
+        &self,
         topic: &str,
         partition_id: i32,
-        records: Vec<Record>,
-    ) -> Result<()> {
+    ) -> Result<mpsc::Sender<PartitionWrite>> {
         let cache_key = (topic.to_owned(), partition_id);
-        if !self.partitions.contains_key(&cache_key) {
-            let partition_client = self
-                .client
+        let mut workers = self.partition_workers.lock().await;
+        if let Some(worker) = workers.get(&cache_key) {
+            return Ok(worker.clone());
+        }
+        let partition = Arc::new(
+            self.client
                 .partition_client(topic.to_owned(), partition_id, UnknownTopicHandling::Error)
                 .await
-                .with_context(|| format!("opening Kafka topic {topic} partition {partition_id}"))?;
-            self.partitions.insert(cache_key.clone(), partition_client);
-        }
-        let partition = self
-            .partitions
-            .get(&cache_key)
-            .expect("partition client was inserted");
-        tokio::time::timeout(
-            self.timeout,
-            partition.produce(records, Compression::default()),
-        )
-        .await
-        .context("timed out waiting for Kafka transaction acknowledgement")?
-        .context("Kafka broker rejected CDC transaction")?;
-        Ok(())
+                .with_context(|| format!("opening Kafka topic {topic} partition {partition_id}"))?,
+        );
+        let (sender, mut receiver) = mpsc::channel::<PartitionWrite>(32);
+        let timeout = self.timeout;
+        let topic_name = topic.to_owned();
+        tokio::spawn(async move {
+            while let Some(first) = receiver.recv().await {
+                // Briefly collect adjacent source-transaction batches so Kafka can
+                // amortize request overhead across the bounded in-flight window.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let mut writes = vec![first];
+                let mut record_count = writes[0].records.len();
+                while record_count < 1_000 {
+                    match receiver.try_recv() {
+                        Ok(write) => {
+                            record_count += write.records.len();
+                            writes.push(write);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let records = writes
+                    .iter_mut()
+                    .flat_map(|write| std::mem::take(&mut write.records))
+                    .collect();
+                let result = tokio::time::timeout(
+                    timeout,
+                    partition.produce(records, Compression::default()),
+                )
+                .await
+                .context("timed out waiting for Kafka transaction acknowledgement")
+                .and_then(|result| {
+                    result
+                        .context("Kafka broker rejected CDC transaction")
+                        .map(|_| ())
+                })
+                .with_context(|| {
+                    format!("producing to Kafka topic {topic_name} partition {partition_id}")
+                });
+                let failed = result.is_err();
+                for write in writes {
+                    let acknowledgement = match &result {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(anyhow::anyhow!("{error:#}")),
+                    };
+                    let _ = write.acknowledgement.send(acknowledgement);
+                }
+                if failed {
+                    while let Some(queued) = receiver.recv().await {
+                        let _ = queued.acknowledgement.send(Err(anyhow::anyhow!(
+                            "Kafka partition worker stopped after an earlier delivery failure"
+                        )));
+                    }
+                    break;
+                }
+            }
+        });
+        workers.insert(cache_key, sender.clone());
+        Ok(sender)
     }
 
-    async fn produce_to_topic(
-        &mut self,
+    async fn enqueue_topic(
+        &self,
         topic: &str,
         records: Vec<(Record, Vec<u8>)>,
-    ) -> Result<()> {
+    ) -> Result<Vec<oneshot::Receiver<Result<()>>>> {
         if self.partition_by.eq_ignore_ascii_case("fixed") {
-            return self
-                .produce_to_partition(
-                    topic,
-                    self.partition_id,
-                    records.into_iter().map(|(record, _)| record).collect(),
-                )
-                .await;
+            let worker = self.partition_worker(topic, self.partition_id).await?;
+            let (acknowledgement, receiver) = oneshot::channel();
+            worker
+                .send(PartitionWrite {
+                    records: records.into_iter().map(|(record, _)| record).collect(),
+                    acknowledgement,
+                })
+                .await
+                .context("Kafka partition delivery queue closed")?;
+            return Ok(vec![receiver]);
         }
 
         let partition_ids = self.partition_ids(topic).await?;
@@ -189,20 +249,44 @@ impl KafkaSink {
             let partition_id = partition_ids[(hash % partition_ids.len() as u64) as usize];
             batches.entry(partition_id).or_default().push(record);
         }
+
+        let mut acknowledgements = Vec::new();
         for (partition_id, records) in batches {
-            self.produce_to_partition(topic, partition_id, records)
-                .await?;
+            let worker = self.partition_worker(topic, partition_id).await?;
+            let (acknowledgement, receiver) = oneshot::channel();
+            worker
+                .send(PartitionWrite {
+                    records,
+                    acknowledgement,
+                })
+                .await
+                .context("Kafka partition delivery queue closed")?;
+            acknowledgements.push(receiver);
         }
-        Ok(())
+        Ok(acknowledgements)
+    }
+
+    async fn wait_dispatch_turn(&self, sequence: usize) {
+        let mut dispatch_sequence = self.dispatch_sequence.subscribe();
+        loop {
+            if *dispatch_sequence.borrow() == sequence {
+                return;
+            }
+            if dispatch_sequence.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn release_dispatch_turn(&self) {
+        self.dispatch_sequence
+            .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl Sink for KafkaSink {
-    async fn write_transaction(&mut self, events: &[CdcEvent]) -> Result<()> {
-        if events.is_empty() {
-            return Ok(());
-        }
+    async fn write_transaction(&self, sequence: usize, events: &[CdcEvent]) -> Result<()> {
         let mut batches: Vec<(String, Vec<(Record, Vec<u8>)>)> = Vec::new();
         for event in events {
             let payload = serde_json::to_vec(event).context("serializing Kafka CDC record")?;
@@ -250,15 +334,31 @@ impl Sink for KafkaSink {
                 batches.push((topic, vec![(record, partition_key)]));
             }
         }
+        self.wait_dispatch_turn(sequence).await;
+        let mut acknowledgements = Vec::new();
+        let mut enqueue_result = Ok(());
         for (topic, records) in batches {
-            self.produce_to_topic(&topic, records).await?;
+            match self.enqueue_topic(&topic, records).await {
+                Ok(mut topic_acknowledgements) => {
+                    acknowledgements.append(&mut topic_acknowledgements);
+                }
+                Err(error) => {
+                    enqueue_result = Err(error);
+                    break;
+                }
+            }
+        }
+        self.release_dispatch_turn();
+        enqueue_result?;
+        for acknowledgement in acknowledgements {
+            acknowledgement
+                .await
+                .context("Kafka partition worker dropped its acknowledgement")??;
         }
         Ok(())
     }
 
-    // Each produce call waits for the broker response before returning, so there
-    // is no client-side queue left to drain here.
-    async fn flush(&mut self) -> Result<()> {
+    async fn flush(&self) -> Result<()> {
         Ok(())
     }
 }

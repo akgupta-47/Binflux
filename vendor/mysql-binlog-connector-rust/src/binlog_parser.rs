@@ -77,6 +77,8 @@ impl BinlogParser {
 
         let event_type = EventType::from_code(header.event_type);
         match event_type {
+            EventType::Stop => Ok((header, EventData::Stop)),
+
             EventType::FormatDescription => {
                 let event_data = FormatDescriptionEvent::parse(&mut cursor, data_length)?;
                 self.checksum_length = event_data.checksum_type.get_length();

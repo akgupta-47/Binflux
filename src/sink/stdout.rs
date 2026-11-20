@@ -1,33 +1,41 @@
 use super::Sink;
 use crate::event::CdcEvent;
 use anyhow::{Context, Result};
-use std::io::{BufWriter, Write};
+use std::{
+    io::{BufWriter, Write},
+    sync::Mutex,
+};
 
-pub struct StdoutSink<W: Write> {
-    writer: BufWriter<W>,
+pub struct StdoutSink<W: Write + Send> {
+    writer: Mutex<BufWriter<W>>,
 }
 
-impl<W: Write> StdoutSink<W> {
+impl<W: Write + Send> StdoutSink<W> {
     pub fn new(writer: W) -> Self {
         Self {
-            writer: BufWriter::new(writer),
+            writer: Mutex::new(BufWriter::new(writer)),
         }
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl<W: Write> Sink for StdoutSink<W> {
-    async fn write_transaction(&mut self, events: &[CdcEvent]) -> Result<()> {
+#[async_trait::async_trait]
+impl<W: Write + Send> Sink for StdoutSink<W> {
+    async fn write_transaction(&self, _sequence: usize, events: &[CdcEvent]) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         for event in events {
-            serde_json::to_writer(&mut self.writer, event)?;
-            self.writer.write_all(b"\n")?;
+            serde_json::to_writer(&mut *writer, event)?;
+            writer.write_all(b"\n")?;
         }
-        self.writer
+        writer
             .flush()
             .context("flushing committed JSONL transaction")
     }
 
-    async fn flush(&mut self) -> Result<()> {
-        self.writer.flush().context("flushing JSONL stdout")
+    async fn flush(&self) -> Result<()> {
+        self.writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .flush()
+            .context("flushing JSONL stdout")
     }
 }
