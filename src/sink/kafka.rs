@@ -4,10 +4,15 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use chrono::{TimeZone, Utc};
+use futures::future::join_all;
 use rskafka::{
     client::{
         Client, ClientBuilder, Credentials, SaslConfig,
-        partition::{Compression, UnknownTopicHandling},
+        partition::UnknownTopicHandling,
+        producer::{
+            BatchProducerBuilder,
+            aggregator::{Aggregator, RecordAggregatorStatusDeaggregator, TryPush},
+        },
     },
     record::Record,
 };
@@ -15,6 +20,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     env,
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -37,6 +44,59 @@ pub struct KafkaSink {
 struct PartitionWrite {
     records: Vec<Record>,
     acknowledgement: oneshot::Sender<Result<()>>,
+}
+
+#[derive(Debug)]
+struct KafkaBatchAggregator {
+    max_batch_size: usize,
+    batch_size: usize,
+    records: Vec<Record>,
+}
+
+impl Aggregator for KafkaBatchAggregator {
+    type Input = Record;
+    type Tag = usize;
+    type StatusDeaggregator = RecordAggregatorStatusDeaggregator;
+
+    fn try_push(
+        &mut self,
+        record: Self::Input,
+    ) -> std::result::Result<
+        TryPush<Self::Input, Self::Tag>,
+        rskafka::client::producer::aggregator::Error,
+    > {
+        let size = record.approximate_size();
+        if !self.records.is_empty() && self.batch_size.saturating_add(size) > self.max_batch_size {
+            return Ok(TryPush::NoCapacity(record));
+        }
+        let tag = self.records.len();
+        self.batch_size = self.batch_size.saturating_add(size);
+        self.records.push(record);
+        Ok(TryPush::Aggregated(tag))
+    }
+
+    fn flush(
+        &mut self,
+    ) -> std::result::Result<
+        (Vec<Record>, Self::StatusDeaggregator),
+        rskafka::client::producer::aggregator::Error,
+    > {
+        self.batch_size = 0;
+        Ok((
+            std::mem::take(&mut self.records),
+            RecordAggregatorStatusDeaggregator::default(),
+        ))
+    }
+}
+
+impl KafkaBatchAggregator {
+    fn new(max_batch_size: usize) -> Self {
+        Self {
+            max_batch_size,
+            batch_size: 0,
+            records: Vec::new(),
+        }
+    }
 }
 
 impl KafkaSink {
@@ -167,56 +227,67 @@ impl KafkaSink {
         let (sender, mut receiver) = mpsc::channel::<PartitionWrite>(32);
         let timeout = self.timeout;
         let topic_name = topic.to_owned();
+        let producer = Arc::new(
+            BatchProducerBuilder::new(partition)
+                .with_linger(Duration::from_millis(5))
+                .build(KafkaBatchAggregator::new(16 * 1024)),
+        );
         tokio::spawn(async move {
-            while let Some(first) = receiver.recv().await {
-                // Briefly collect adjacent source-transaction batches so Kafka can
-                // amortize request overhead across the bounded in-flight window.
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                let mut writes = vec![first];
-                let mut record_count = writes[0].records.len();
-                while record_count < 1_000 {
-                    match receiver.try_recv() {
-                        Ok(write) => {
-                            record_count += write.records.len();
-                            writes.push(write);
+            while let Some(write) = receiver.recv().await {
+                let mut pending: Vec<Pin<Box<dyn Future<Output = Result<()>> + Send>>> = Vec::new();
+                let mut enqueue_error = None;
+
+                // Poll each produce future once. BatchProducer queues the record
+                // synchronously before that future waits for its broker delivery
+                // acknowledgement, so the worker can enqueue later transactions
+                // in order while earlier requests remain in flight.
+                for record in write.records {
+                    let producer = producer.clone();
+                    let topic_name = topic_name.clone();
+                    let mut delivery: Pin<Box<dyn Future<Output = Result<()>> + Send>> =
+                        Box::pin(async move {
+                            tokio::time::timeout(timeout, producer.produce(record))
+                            .await
+                            .context("timed out waiting for Kafka record acknowledgement")?
+                            .context("Kafka broker rejected CDC record")
+                            .map(|_| ())
+                            .with_context(|| {
+                                format!(
+                                    "producing to Kafka topic {topic_name} partition {partition_id}"
+                                )
+                            })
+                        });
+                    let first_poll = std::future::poll_fn(|cx| match delivery.as_mut().poll(cx) {
+                        std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+                        std::task::Poll::Pending => std::task::Poll::Ready(None),
+                    })
+                    .await;
+                    match first_poll {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => {
+                            enqueue_error = Some(error);
+                            break;
                         }
-                        Err(_) => break,
+                        None => pending.push(delivery),
                     }
                 }
-                let records = writes
-                    .iter_mut()
-                    .flat_map(|write| std::mem::take(&mut write.records))
-                    .collect();
-                let result = tokio::time::timeout(
-                    timeout,
-                    partition.produce(records, Compression::default()),
-                )
-                .await
-                .context("timed out waiting for Kafka transaction acknowledgement")
-                .and_then(|result| {
-                    result
-                        .context("Kafka broker rejected CDC transaction")
-                        .map(|_| ())
-                })
-                .with_context(|| {
-                    format!("producing to Kafka topic {topic_name} partition {partition_id}")
+
+                if let Some(error) = enqueue_error {
+                    let _ = write.acknowledgement.send(Err(error));
+                    continue;
+                }
+
+                let acknowledgement = write.acknowledgement;
+                tokio::spawn(async move {
+                    let mut first_error = None;
+                    for result in join_all(pending).await {
+                        if let Err(error) = result {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                    let result = first_error.map_or(Ok(()), Err);
+                    let _ = acknowledgement.send(result);
                 });
-                let failed = result.is_err();
-                for write in writes {
-                    let acknowledgement = match &result {
-                        Ok(()) => Ok(()),
-                        Err(error) => Err(anyhow::anyhow!("{error:#}")),
-                    };
-                    let _ = write.acknowledgement.send(acknowledgement);
-                }
-                if failed {
-                    while let Some(queued) = receiver.recv().await {
-                        let _ = queued.acknowledgement.send(Err(anyhow::anyhow!(
-                            "Kafka partition worker stopped after an earlier delivery failure"
-                        )));
-                    }
-                    break;
-                }
             }
         });
         workers.insert(cache_key, sender.clone());
